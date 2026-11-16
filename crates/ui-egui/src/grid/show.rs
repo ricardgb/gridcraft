@@ -147,48 +147,74 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     // Everything up to the headers is painted in logical (left-to-right) coordinates.
     let mirror_from = painter.add(egui::Shape::Noop);
     let mut cf = CfCache::new();
-    // A plain sheet's cells go on a layer of their own, painted for whole
-    // tiles and moved by the scroll within a tile (`tile_geo`): a backend
-    // that keeps that layer as one picture then sees a scroll as a move,
-    // not as a new picture (LaurenceWM's drawing stream). The selection
-    // and the objects are on it too; overlays go on a layer above it,
-    // where they are.
+    // A sheet's cells go on layers of their own, one for each pane, painted
+    // for whole tiles and moved by the scroll within a tile (`tile_geo`): a
+    // backend that keeps such a layer as one picture then sees a scroll as
+    // a move, not as a new picture (LaurenceWM's drawing stream). The
+    // selection is on them too, and the objects move with the pane they
+    // are anchored in; overlays go on a layer above, where they are.
     let cells_layers = CellsLayers::new(ui.ctx(), painter.layer_id());
-    let tiled = geo.paper.is_none() && !geo.rtl && geo.fr == 0 && geo.fc == 0;
+    let tiled = geo.paper.is_none() && !geo.rtl;
     let over = cells_layers.over(ui.ctx(), rect);
     let quads = if tiled {
-        let (tile, shift) = tile_geo(&geo);
-        cells_layers.place(ui.ctx(), Some((shift, geo.cells)));
-        // The tile's own clip, not the screen's: a layer painter starts
-        // clipped to the screen, which the tile reaches past.
-        let mut tp = ui.ctx().layer_painter(cells_layers.tiles);
-        tp.set_clip_rect(tile.cells);
-        paint_tiles(&tp, &tile, &wb, si, sh, app.ui.highlight_active_row.then_some(sel.active.row), &mut cf, &t);
-        // The selection and the objects move with the cells: on their
-        // layer too, from the tiles' geometry (the gliding outline is in
-        // screen coordinates: moved into the layer's).
-        for (rows, cols, clip) in &pane_quads(&tile, sh) {
-            if rows.0 > rows.1 || cols.0 > cols.1 {
-                continue;
-            }
-            let p = tp.with_clip_rect(*clip);
-            paint_selection(SelectionPaintInput {
-                painter: &p,
-                geo: &tile,
-                sheet: sh,
-                selection: &sel,
-                outline: outline.translate(-shift),
-                tokens: &t,
-                app,
-                rows: *rows,
-                cols: *cols,
-            });
-        }
+        let quads = pane_quads(&geo, sh);
         if crate::chartview::objects_hidden(&wb) {
             app.selected_object = None;
         }
-        crate::chartview::paint_objects(app, &tp, &tile, &wb, si, sh);
-        pane_quads(&geo, sh)
+        let outlined = if crate::chartview::objects_hidden(&wb) { None } else { crate::chartview::outlined_chart(app, &geo, sh, geo.cells) };
+        let hover = crate::chartview::objects_hover(ui.ctx(), &geo);
+        for (i, (moves, (_, _, view))) in pane_moves(&geo).into_iter().zip(&quads).enumerate() {
+            let (tile, shift) = tile_geo(&geo, moves);
+            let (rows, cols, clip) = pane_quads(&tile, sh)[i];
+            CellsLayers::place_layer(ui.ctx(), cells_layers.panes[i], Some((shift, *view)));
+            // The tile's own clip, not the screen's: a layer painter starts
+            // clipped to the screen, which the tile reaches past.
+            let mut tp = ui.ctx().layer_painter(cells_layers.panes[i]);
+            tp.set_clip_rect(clip);
+            if rows.0 <= rows.1 && cols.0 <= cols.1 {
+                paint_quadrant(QuadrantPaint {
+                    painter: &tp,
+                    geo: &tile,
+                    workbook: &wb,
+                    sheet_index: si,
+                    sheet: sh,
+                    rows,
+                    cols,
+                    cf: &mut cf,
+                    tokens: &t,
+                    active_row: app.ui.highlight_active_row.then_some(sel.active.row),
+                });
+                // The selection moves with the cells: on their layer, from
+                // the tiles' geometry (the gliding outline is in screen
+                // coordinates: moved into the layer's).
+                paint_selection(SelectionPaintInput {
+                    painter: &tp,
+                    geo: &tile,
+                    sheet: sh,
+                    selection: &sel,
+                    outline: outline.translate(-shift),
+                    tokens: &t,
+                    app,
+                    rows,
+                    cols,
+                });
+            }
+            if let Some(ch) = outlined {
+                crate::chartview::paint_source_outlines(&tp, &tile, sh, ch);
+            }
+            // The objects anchored in this pane move with it, over every
+            // pane: with frozen panes on a layer above all the cells,
+            // clipped to their whole area.
+            if quads.len() > 1 {
+                CellsLayers::place_layer(ui.ctx(), cells_layers.objects[i], Some((shift, geo.cells)));
+                tp = ui.ctx().layer_painter(cells_layers.objects[i]);
+                tp.set_clip_rect(tile.cells);
+            }
+            let here = |a: &gridcraft_engine::model::Anchor| (a.cell.col >= geo.fc, a.cell.row >= geo.fr) == moves;
+            crate::chartview::paint_objects_where(app, &tp, &tile, &wb, si, sh, hover.map(|h| h - shift), here);
+        }
+        paint_freeze_lines(&ui.ctx().layer_painter(cells_layers.lines).with_clip_rect(rect), &geo);
+        quads
     } else if geo.paper.is_some() {
         crate::paper_view::paint_pages(
             crate::paper_view::PagePaintInput {
@@ -210,9 +236,6 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
             &mut cf,
         )
     };
-    if !tiled {
-        cells_layers.place(ui.ctx(), None);
-    }
     // What is painted over the cells: above the tiles when there are some.
     let above = if tiled { over.clone() } else { painter.clone() };
     // Objects above cells. A hidden object can't stay selected: Delete or the Format pane would act
@@ -243,26 +266,37 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
         if tiled {
             // Column headers move with the cells across, row headers down:
             // each on a layer of its own, painted from the tiles' geometry.
-            let (tile, shift) = tile_geo(&geo);
-            let tile_quads = pane_quads(&tile, sh);
-            let tile_headings = table_headings(&tile, sh, sel.active);
+            // Those of frozen columns and rows stay, with the corner.
+            let moves = pane_moves(&geo);
             let head = Rect::from_min_max(pos2(geo.head_left(), geo.head_top()), geo.rect.max);
+            let split = pos2(geo.cells.left() + geo.frozen_w, geo.cells.top() + geo.frozen_h);
             let top = Rect::from_min_max(pos2(geo.cells.left(), head.top()), pos2(head.right(), geo.cells.top()));
             let left = Rect::from_min_max(pos2(head.left(), geo.cells.top()), pos2(geo.cells.left(), head.bottom()));
-            for (layer, part, shift, clip) in [
-                (cells_layers.columns, HeaderPart::Columns, vec2(shift.x, 0.0), top),
-                (cells_layers.rows, HeaderPart::Rows, vec2(0.0, shift.y), left),
-            ] {
+            for (layer, part, across) in [(cells_layers.columns, HeaderPart::Columns, true), (cells_layers.rows, HeaderPart::Rows, false)] {
+                let moved = |m: &(bool, bool)| if across { m.0 } else { m.1 };
+                let part_quads = |g: &Geo, moving: bool| -> Vec<PaneQuad> {
+                    pane_quads(g, sh).into_iter().zip(&moves).filter(|(_, m)| moved(m) == moving).map(|(q, _)| q).collect()
+                };
+                let (tile, shift) = tile_geo(&geo, (across, !across));
+                let (clip, stays) = if across {
+                    (top.with_min_x(split.x), top.with_max_x(split.x))
+                } else {
+                    (left.with_min_y(split.y), left.with_max_y(split.y))
+                };
                 CellsLayers::place_layer(ui.ctx(), layer, Some((shift, clip)));
                 let mut hp = ui.ctx().layer_painter(layer);
                 hp.set_clip_rect(Rect::EVERYTHING);
-                paint_headers(&hp, &tile, sh, &sel, &t, &tile_quads, &tile_headings, part);
+                paint_headers(&hp, &tile, sh, &sel, &t, &part_quads(&tile, true), &table_headings(&tile, sh, sel.active), part);
+                if stays.is_positive() {
+                    paint_headers(&over.with_clip_rect(stays), &geo, sh, &sel, &t, &part_quads(&geo, false), &headings, part);
+                }
             }
             paint_headers(&over, &geo, sh, &sel, &t, &quads, &headings, HeaderPart::Frame);
         } else {
             paint_headers(&painter, &geo, sh, &sel, &t, &quads, &headings, HeaderPart::All);
         }
-        paint_freeze_handles(&painter, &geo, sh, &app.grid.drag, &t);
+        // The handles are on the headers: over their layers.
+        paint_freeze_handles(if tiled { &over } else { &painter }, &geo, sh, &app.grid.drag, &t);
     }
     crate::outline::paint(&painter, &geo, sh, &t);
     if geo.rtl {
@@ -455,11 +489,17 @@ struct PanesInput<'a> {
     tokens: &'a Tokens,
 }
 
-/// The layers a plain sheet's cells are painted on (see `show`): `tiles`
-/// right above the grid's own layer, moved by the scroll, and `over`
-/// above that, for what is painted over the cells where it is.
+/// The layers a sheet's cells are painted on (see `show`): a layer for each
+/// pane right above the grid's own layer, moved by the scroll, and `over`
+/// above them all, for what is painted over the cells where it is.
 struct CellsLayers {
-    tiles: egui::LayerId,
+    /// The panes' cells, in `pane_quads`' order.
+    panes: [egui::LayerId; 4],
+    /// The freeze lines: over the cells, under the objects.
+    lines: egui::LayerId,
+    /// The objects anchored in each pane, when there are frozen panes (a
+    /// plain sheet's are on its one pane's layer).
+    objects: [egui::LayerId; 4],
     /// The column and row headers, moved across and down with the cells.
     columns: egui::LayerId,
     rows: egui::LayerId,
@@ -468,33 +508,31 @@ struct CellsLayers {
 
 impl CellsLayers {
     fn new(ctx: &egui::Context, base: egui::LayerId) -> Self {
-        let tiles = egui::LayerId::new(base.order, base.id.with("gridcraft.cells.tiles"));
-        let columns = egui::LayerId::new(base.order, base.id.with("gridcraft.cells.columns"));
-        let rows = egui::LayerId::new(base.order, base.id.with("gridcraft.cells.rows"));
-        let over = egui::LayerId::new(base.order, base.id.with("gridcraft.cells.over"));
-        // Directly above the grid's layer, tiles first (sublayers keep the
-        // order they were first added in).
-        ctx.set_sublayer(base, tiles);
-        ctx.set_sublayer(base, columns);
-        ctx.set_sublayer(base, rows);
-        ctx.set_sublayer(base, over);
-        Self { tiles, columns, rows, over }
+        // Directly above the grid's layer, cells first (sublayers keep the
+        // order they were first added in). Not moved until `show` places
+        // them: a layer keeps its transform and clip from frame to frame.
+        let layer = |name: &str, i: usize| {
+            let layer = egui::LayerId::new(base.order, base.id.with(("gridcraft.cells", name, i)));
+            ctx.set_sublayer(base, layer);
+            layer
+        };
+        let moved = |name: &str, i: usize| {
+            let layer = layer(name, i);
+            Self::place_layer(ctx, layer, None);
+            layer
+        };
+        let panes = std::array::from_fn(|i| moved("pane", i));
+        let lines = layer("lines", 0);
+        let objects = std::array::from_fn(|i| moved("objects", i));
+        Self { panes, lines, objects, columns: moved("columns", 0), rows: moved("rows", 0), over: layer("over", 0) }
     }
 
     fn over(&self, ctx: &egui::Context, clip: Rect) -> Painter {
         ctx.layer_painter(self.over).with_clip_rect(clip)
     }
 
-    /// The tiles moved by `shift` and kept inside `clip` on the screen; or
+    /// A layer moved by `shift` and kept inside `clip` on the screen; or
     /// not moved at all.
-    fn place(&self, ctx: &egui::Context, at: Option<(egui::Vec2, Rect)>) {
-        Self::place_layer(ctx, self.tiles, at);
-        if at.is_none() {
-            Self::place_layer(ctx, self.columns, None);
-            Self::place_layer(ctx, self.rows, None);
-        }
-    }
-
     fn place_layer(ctx: &egui::Context, layer: egui::LayerId, at: Option<(egui::Vec2, Rect)>) {
         match at {
             Some((shift, clip)) => {
@@ -514,41 +552,49 @@ impl CellsLayers {
 /// than the view, and moved back by the rest.
 const TILE: f32 = 256.0;
 
-/// The grid's geometry as the tiles paint it: the scroll rounded down to a
-/// tile, the cells' area a tile larger; and how far that is moved on the
-/// screen to land where `geo` has the cells. Everything else is `geo`'s
-/// (header widths included), so the cells line up with the headers.
-fn tile_geo(geo: &Geo) -> (Geo, egui::Vec2) {
-    let off = geo.scroll * geo.z;
-    let snapped = vec2((off.x / TILE).floor() * TILE, (off.y / TILE).floor() * TILE);
+/// The grid's geometry as a pane's tiles paint it, for a pane that moves
+/// with the scroll across, down, or both (`moves`): on those axes the
+/// scroll rounded down to a tile and the cells' area a tile larger; and how
+/// far that is moved on the screen to land where `geo` has the pane.
+/// Everything else is `geo`'s (header widths included), so the cells line
+/// up with the headers, and a frozen pane's cells are where `geo` has them.
+fn tile_geo(geo: &Geo, moves: (bool, bool)) -> (Geo, egui::Vec2) {
     let mut g = geo.clone();
-    g.scroll = snapped / geo.z;
-    g.cells.max += vec2(TILE, TILE);
-    g.rect.max += vec2(TILE, TILE);
-    (g, snapped - off)
+    let mut shift = egui::Vec2::ZERO;
+    if moves.0 {
+        let off = geo.scroll.x * geo.z;
+        let snapped = (off / TILE).floor() * TILE;
+        g.scroll.x = snapped / geo.z;
+        g.cells.max.x += TILE;
+        g.rect.max.x += TILE;
+        shift.x = snapped - off;
+    }
+    if moves.1 {
+        let off = geo.scroll.y * geo.z;
+        let snapped = (off / TILE).floor() * TILE;
+        g.scroll.y = snapped / geo.z;
+        g.cells.max.y += TILE;
+        g.rect.max.y += TILE;
+        shift.y = snapped - off;
+    }
+    (g, shift)
 }
 
-/// The cells of a plain sheet, on the tiles layer: one quadrant, all of the
-/// tile geometry's rows and columns, clipped by it only.
-#[allow(clippy::too_many_arguments)]
-fn paint_tiles(painter: &Painter, geo: &Geo, wb: &Workbook, si: usize, sh: &Sheet, active_row: Option<u32>, cf: &mut CfCache, t: &Tokens) {
-    let rows = geo.scroll_rows(sh);
-    let cols = geo.scroll_cols(sh);
-    if rows.0 > rows.1 || cols.0 > cols.1 {
-        return;
+/// Whether each of `pane_quads`' panes moves with the scroll (across,
+/// down), in their order: the scrolling part both ways, frozen rows across
+/// only, frozen columns down only, the corner between them not at all.
+fn pane_moves(geo: &Geo) -> Vec<(bool, bool)> {
+    let mut moves = vec![(true, true)];
+    if geo.fr > 0 {
+        moves.push((true, false));
     }
-    paint_quadrant(QuadrantPaint {
-        painter,
-        geo,
-        workbook: wb,
-        sheet_index: si,
-        sheet: sh,
-        rows,
-        cols,
-        cf,
-        tokens: t,
-        active_row,
-    });
+    if geo.fc > 0 {
+        moves.push((false, true));
+    }
+    if geo.fr > 0 && geo.fc > 0 {
+        moves.push((false, false));
+    }
+    moves
 }
 
 /// The panes of the grid: (rows, columns, clip) for the scrolling part and
@@ -576,7 +622,6 @@ fn paint_panes(input: PanesInput<'_>, cf: &mut CfCache) -> Vec<PaneQuad> {
     let PanesInput { app, painter, geo, workbook: wb, sheet_index: si, sheet: sh, selection: sel, outline, tokens: t } = input;
     // Quadrants: (rows, cols, clip).
     let quads = pane_quads(geo, sh);
-    let split = pos2(geo.cells.left() + geo.frozen_w, geo.cells.top() + geo.frozen_h);
     for (rows, cols, clip) in &quads {
         if rows.0 > rows.1 || cols.0 > cols.1 {
             continue;
@@ -597,14 +642,18 @@ fn paint_panes(input: PanesInput<'_>, cf: &mut CfCache) -> Vec<PaneQuad> {
         });
         paint_selection(SelectionPaintInput { painter: &p, geo, sheet: sh, selection: sel, outline, tokens: t, app, rows: *rows, cols: *cols });
     }
-    // Freeze lines.
+    paint_freeze_lines(painter, geo);
+    quads
+}
+
+fn paint_freeze_lines(painter: &Painter, geo: &Geo) {
+    let split = pos2(geo.cells.left() + geo.frozen_w, geo.cells.top() + geo.frozen_h);
     if geo.fr > 0 {
         painter.line_segment([pos2(geo.cells.left(), split.y), pos2(geo.cells.right(), split.y)], Stroke::new(1.0, Color32::from_gray(150)));
     }
     if geo.fc > 0 {
         painter.line_segment([pos2(split.x, geo.cells.top()), pos2(split.x, geo.cells.bottom())], Stroke::new(1.0, Color32::from_gray(150)));
     }
-    quads
 }
 
 /// The worksheet is painted virtually, so it needs its own scrollbar rather than a
@@ -719,7 +768,8 @@ pub(crate) fn horizontal_scrollbar(app: &mut SheetApp, ui: &mut egui::Ui, track:
 
 /// What of the headers `paint_headers` paints: all of them, or, when the
 /// column and row headers are on layers of their own that the scroll
-/// moves (see `show`), each of those alone and the corner and edges, which
+/// moves (see `show`), each of those alone (for the panes given: the
+/// headers of frozen columns and rows stay) and the corner and edges, which
 /// stay where they are.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeaderPart {

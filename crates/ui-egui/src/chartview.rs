@@ -259,34 +259,66 @@ pub(crate) fn objects_hidden(wb: &Workbook) -> bool {
     wb.show_objects == gridcraft_engine::model::ShowObjects::None
 }
 
+/// The selected chart whose source ranges are outlined: while any of it is inside `view`.
+pub(crate) fn outlined_chart<'a>(app: &SheetApp, geo: &Geo, sh: &'a Sheet, view: Rect) -> Option<&'a gridcraft_engine::model::Chart> {
+    sh.charts.iter().find(|ch| app.selected_chart() == Some(ch.id)).filter(|ch| anchor_rect(geo, sh, &ch.anchor).intersects(view))
+}
+
+/// Source outlines stay in cell space beneath every floating object.
+pub(crate) fn paint_source_outlines(p: &Painter, geo: &Geo, sh: &Sheet, ch: &gridcraft_engine::model::Chart) {
+    for s in &ch.series {
+        if let Ok(gridcraft_engine::formula::Expr::Ref(rf)) = gridcraft_engine::formula::parse(&s.values)
+            && rf.sheet_name().is_none_or(|n| n.eq_ignore_ascii_case(&sh.name))
+        {
+            let rr = geo.range_rect(sh, rf.range());
+            let color = Tokens::get(p.ctx()).ref_color(0, true);
+            // A painter that has one pane only (a grid with a layer for each) meets the others' edges.
+            for pane in geo.range_panes(rf.range()).into_iter().map(|pane| pane.intersect(p.clip_rect())).filter(|pane| pane.is_positive()) {
+                p.with_clip_rect(pane).rect_stroke(rr, 0.0, Stroke::new(1.5, color), StrokeKind::Inside);
+            }
+        }
+    }
+}
+
+/// The pointer over the cells (a logical position), for the look of the form controls.
+pub(crate) fn objects_hover(ctx: &egui::Context, geo: &Geo) -> Option<Pos2> {
+    ctx.input(|i| i.pointer.hover_pos()).map(|h| geo.mirror_pos(h)).filter(|h| geo.in_cells(*h))
+}
+
 pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workbook, si: usize, sh: &Sheet) -> Vec<PaintedObject> {
+    if objects_hidden(wb) {
+        return Vec::new();
+    }
+    if let Some(ch) = outlined_chart(app, geo, sh, p.clip_rect()) {
+        paint_source_outlines(p, geo, sh, ch);
+    }
+    paint_objects_where(app, p, geo, wb, si, sh, objects_hover(p.ctx(), geo), |_| true)
+}
+
+/// The floating objects whose anchor `keep` accepts, without the source outlines: all of them, or
+/// those of one pane for a grid that paints each pane's on a layer of its own (`grid::show`).
+/// `hover` is the pointer in `geo`'s coordinates.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_objects_where(
+    app: &SheetApp,
+    p: &Painter,
+    geo: &Geo,
+    wb: &Workbook,
+    si: usize,
+    sh: &Sheet,
+    hover: Option<Pos2>,
+    keep: impl Fn(&Anchor) -> bool,
+) -> Vec<PaintedObject> {
     let mut painted = Vec::new();
     if objects_hidden(wb) {
         return painted;
-    }
-    // Source outlines stay in cell space beneath every floating object.
-    if let Some(ch) = sh.charts.iter().find(|ch| app.selected_chart() == Some(ch.id))
-        && anchor_rect(geo, sh, &ch.anchor).intersects(p.clip_rect())
-    {
-        for s in &ch.series {
-            if let Ok(gridcraft_engine::formula::Expr::Ref(rf)) = gridcraft_engine::formula::parse(&s.values)
-                && rf.sheet_name().is_none_or(|n| n.eq_ignore_ascii_case(&sh.name))
-            {
-                let rr = geo.range_rect(sh, rf.range());
-                let color = Tokens::get(p.ctx()).ref_color(0, true);
-                for pane in geo.range_panes(rf.range()) {
-                    let pp = p.with_clip_rect(pane.intersect(p.clip_rect()));
-                    pp.rect_stroke(rr, 0.0, Stroke::new(1.5, color), StrokeKind::Inside);
-                }
-            }
-        }
     }
     let mut done = |start: egui::layers::ShapeIdx, rect: Rect| painted.push(PaintedObject { shapes: start.0..p.add(egui::Shape::Noop).0, rect });
     // The grid paints the active workbook: its pictures are cached under it.
     let doc = app.session.active().map_or(0, |d| d.uid);
     for sp in &sh.shapes {
         let r = anchor_rect(geo, sh, &sp.anchor);
-        if !r.intersects(p.clip_rect()) {
+        if !keep(&sp.anchor) || !r.intersects(p.clip_rect()) {
             continue;
         }
         let start = p.add(egui::Shape::Noop);
@@ -354,7 +386,7 @@ pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workboo
     }
     for im in &sh.images {
         let r = anchor_rect(geo, sh, &im.anchor);
-        if !r.intersects(p.clip_rect()) {
+        if !keep(&im.anchor) || !r.intersects(p.clip_rect()) {
             continue;
         }
         let start = p.add(egui::Shape::Noop);
@@ -367,7 +399,7 @@ pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workboo
     }
     for ch in &sh.charts {
         let r = anchor_rect(geo, sh, &ch.anchor);
-        if !r.intersects(p.clip_rect()) {
+        if !keep(&ch.anchor) || !r.intersects(p.clip_rect()) {
             continue;
         }
         let start = p.add(egui::Shape::Noop);
@@ -380,13 +412,12 @@ pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workboo
         paint_prims(&p.with_clip_rect(r.intersect(p.clip_rect())), r.min, &prims, geo.z);
         done(start, r);
     }
-    paint_slicers(p, geo, wb, si, sh);
+    paint_slicers(p, geo, wb, si, sh, &keep);
     // Form controls sit above every other object.
-    let hover = p.ctx().input(|i| i.pointer.hover_pos()).map(|h| geo.mirror_pos(h)).filter(|h| geo.in_cells(*h));
     for c in &sh.controls {
         let r = anchor_rect(geo, sh, &c.anchor);
         // A slider's value shows beside it while it is dragged.
-        if !r.expand(24.0).intersects(p.clip_rect()) {
+        if !keep(&c.anchor) || !r.expand(24.0).intersects(p.clip_rect()) {
             continue;
         }
         let start = p.add(egui::Shape::Noop);
@@ -395,7 +426,7 @@ pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workboo
     }
     // The selected object's frame and handles go over every object, and move with it on a
     // right-to-left sheet.
-    if let Some(r) = app.selected_object.and_then(|o| object_rect(geo, sh, o))
+    if let Some(r) = app.selected_object.and_then(|o| sh.object_anchor(o)).filter(|a| keep(a)).map(|a| anchor_rect(geo, sh, &a))
         && r.intersects(p.clip_rect())
     {
         let start = p.add(egui::Shape::Noop);
@@ -438,11 +469,11 @@ pub fn slicer_layout(rect: Rect, z: f32, n: usize, columns: u32) -> SlicerLayout
     SlicerLayout { header, clear, tiles }
 }
 
-fn paint_slicers(p: &Painter, geo: &Geo, wb: &Workbook, si: usize, sh: &Sheet) {
+fn paint_slicers(p: &Painter, geo: &Geo, wb: &Workbook, si: usize, sh: &Sheet, keep: &impl Fn(&Anchor) -> bool) {
     let tk = theme::Tokens::get(p.ctx());
     for sl in &sh.slicers {
         let r = anchor_rect(geo, sh, &sl.anchor);
-        if !r.intersects(p.clip_rect()) {
+        if !keep(&sl.anchor) || !r.intersects(p.clip_rect()) {
             continue;
         }
         let items = gridcraft_engine::cmd::slicer::slicer_items(wb, si, sl);
