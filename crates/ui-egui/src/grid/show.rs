@@ -150,8 +150,9 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     // A plain sheet's cells go on a layer of their own, painted for whole
     // tiles and moved by the scroll within a tile (`tile_geo`): a backend
     // that keeps that layer as one picture then sees a scroll as a move,
-    // not as a new picture (LaurenceWM's drawing stream). The selection,
-    // objects and overlays go on a layer above it, where they are.
+    // not as a new picture (LaurenceWM's drawing stream). The selection
+    // and the objects are on it too; overlays go on a layer above it,
+    // where they are.
     let cells_layers = CellsLayers::new(ui.ctx(), painter.layer_id());
     let tiled = geo.paper.is_none() && !geo.rtl && geo.fr == 0 && geo.fc == 0;
     let over = cells_layers.over(ui.ctx(), rect);
@@ -163,15 +164,31 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
         let mut tp = ui.ctx().layer_painter(cells_layers.tiles);
         tp.set_clip_rect(tile.cells);
         paint_tiles(&tp, &tile, &wb, si, sh, app.ui.highlight_active_row.then_some(sel.active.row), &mut cf, &t);
-        let quads = pane_quads(&geo, sh);
-        for (rows, cols, clip) in &quads {
+        // The selection and the objects move with the cells: on their
+        // layer too, from the tiles' geometry (the gliding outline is in
+        // screen coordinates: moved into the layer's).
+        for (rows, cols, clip) in &pane_quads(&tile, sh) {
             if rows.0 > rows.1 || cols.0 > cols.1 {
                 continue;
             }
-            let p = over.with_clip_rect(*clip);
-            paint_selection(SelectionPaintInput { painter: &p, geo: &geo, sheet: sh, selection: &sel, outline, tokens: &t, app, rows: *rows, cols: *cols });
+            let p = tp.with_clip_rect(*clip);
+            paint_selection(SelectionPaintInput {
+                painter: &p,
+                geo: &tile,
+                sheet: sh,
+                selection: &sel,
+                outline: outline.translate(-shift),
+                tokens: &t,
+                app,
+                rows: *rows,
+                cols: *cols,
+            });
         }
-        quads
+        if crate::chartview::objects_hidden(&wb) {
+            app.selected_object = None;
+        }
+        crate::chartview::paint_objects(app, &tp, &tile, &wb, si, sh);
+        pane_quads(&geo, sh)
     } else if geo.paper.is_some() {
         crate::paper_view::paint_pages(
             crate::paper_view::PagePaintInput {
@@ -203,7 +220,7 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     if crate::chartview::objects_hidden(&wb) {
         app.selected_object = None;
     }
-    let objects = crate::chartview::paint_objects(app, &above.with_clip_rect(geo.cells), &geo, &wb, si, sh);
+    let objects = if tiled { Vec::new() } else { crate::chartview::paint_objects(app, &above.with_clip_rect(geo.cells), &geo, &wb, si, sh) };
     paint_overlays(OverlayInput {
         app,
         ui,
@@ -223,7 +240,28 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     // Headers.
     if sh.show_headings {
         let headings = table_headings(&geo, sh, sel.active);
-        paint_headers(&painter, &geo, sh, &sel, &t, &quads, &headings);
+        if tiled {
+            // Column headers move with the cells across, row headers down:
+            // each on a layer of its own, painted from the tiles' geometry.
+            let (tile, shift) = tile_geo(&geo);
+            let tile_quads = pane_quads(&tile, sh);
+            let tile_headings = table_headings(&tile, sh, sel.active);
+            let head = Rect::from_min_max(pos2(geo.head_left(), geo.head_top()), geo.rect.max);
+            let top = Rect::from_min_max(pos2(geo.cells.left(), head.top()), pos2(head.right(), geo.cells.top()));
+            let left = Rect::from_min_max(pos2(head.left(), geo.cells.top()), pos2(geo.cells.left(), head.bottom()));
+            for (layer, part, shift, clip) in [
+                (cells_layers.columns, HeaderPart::Columns, vec2(shift.x, 0.0), top),
+                (cells_layers.rows, HeaderPart::Rows, vec2(0.0, shift.y), left),
+            ] {
+                CellsLayers::place_layer(ui.ctx(), layer, Some((shift, clip)));
+                let mut hp = ui.ctx().layer_painter(layer);
+                hp.set_clip_rect(Rect::EVERYTHING);
+                paint_headers(&hp, &tile, sh, &sel, &t, &tile_quads, &tile_headings, part);
+            }
+            paint_headers(&over, &geo, sh, &sel, &t, &quads, &headings, HeaderPart::Frame);
+        } else {
+            paint_headers(&painter, &geo, sh, &sel, &t, &quads, &headings, HeaderPart::All);
+        }
         paint_freeze_handles(&painter, &geo, sh, &app.grid.drag, &t);
     }
     crate::outline::paint(&painter, &geo, sh, &t);
@@ -422,18 +460,25 @@ struct PanesInput<'a> {
 /// above that, for what is painted over the cells where it is.
 struct CellsLayers {
     tiles: egui::LayerId,
+    /// The column and row headers, moved across and down with the cells.
+    columns: egui::LayerId,
+    rows: egui::LayerId,
     over: egui::LayerId,
 }
 
 impl CellsLayers {
     fn new(ctx: &egui::Context, base: egui::LayerId) -> Self {
         let tiles = egui::LayerId::new(base.order, base.id.with("gridcraft.cells.tiles"));
+        let columns = egui::LayerId::new(base.order, base.id.with("gridcraft.cells.columns"));
+        let rows = egui::LayerId::new(base.order, base.id.with("gridcraft.cells.rows"));
         let over = egui::LayerId::new(base.order, base.id.with("gridcraft.cells.over"));
         // Directly above the grid's layer, tiles first (sublayers keep the
         // order they were first added in).
         ctx.set_sublayer(base, tiles);
+        ctx.set_sublayer(base, columns);
+        ctx.set_sublayer(base, rows);
         ctx.set_sublayer(base, over);
-        Self { tiles, over }
+        Self { tiles, columns, rows, over }
     }
 
     fn over(&self, ctx: &egui::Context, clip: Rect) -> Painter {
@@ -443,14 +488,22 @@ impl CellsLayers {
     /// The tiles moved by `shift` and kept inside `clip` on the screen; or
     /// not moved at all.
     fn place(&self, ctx: &egui::Context, at: Option<(egui::Vec2, Rect)>) {
+        Self::place_layer(ctx, self.tiles, at);
+        if at.is_none() {
+            Self::place_layer(ctx, self.columns, None);
+            Self::place_layer(ctx, self.rows, None);
+        }
+    }
+
+    fn place_layer(ctx: &egui::Context, layer: egui::LayerId, at: Option<(egui::Vec2, Rect)>) {
         match at {
             Some((shift, clip)) => {
-                ctx.set_transform_layer(self.tiles, egui::emath::TSTransform::from_translation(shift));
-                ctx.set_clip_layer(self.tiles, Some(clip));
+                ctx.set_transform_layer(layer, egui::emath::TSTransform::from_translation(shift));
+                ctx.set_clip_layer(layer, Some(clip));
             }
             None => {
-                ctx.set_transform_layer(self.tiles, egui::emath::TSTransform::IDENTITY);
-                ctx.set_clip_layer(self.tiles, None);
+                ctx.set_transform_layer(layer, egui::emath::TSTransform::IDENTITY);
+                ctx.set_clip_layer(layer, None);
             }
         }
     }
@@ -664,6 +717,18 @@ pub(crate) fn horizontal_scrollbar(app: &mut SheetApp, ui: &mut egui::Ui, track:
     }
 }
 
+/// What of the headers `paint_headers` paints: all of them, or, when the
+/// column and row headers are on layers of their own that the scroll
+/// moves (see `show`), each of those alone and the corner and edges, which
+/// stay where they are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderPart {
+    All,
+    Columns,
+    Rows,
+    Frame,
+}
+
 pub(crate) fn paint_headers(
     p: &Painter,
     geo: &Geo,
@@ -672,14 +737,19 @@ pub(crate) fn paint_headers(
     t: &Tokens,
     quads: &[PaneQuad],
     headings: &[TableHeading],
+    part: HeaderPart,
 ) {
     let font = theme::ui_font(heading_font_size(geo.z));
     // The headers' own area: inside the outline bands.
     let r = Rect::from_min_max(pos2(geo.head_left(), geo.head_top()), geo.rect.max);
     let top = Rect::from_min_max(pos2(geo.cells.left(), r.top()), pos2(r.right(), geo.cells.top()));
     let left = Rect::from_min_max(pos2(r.left(), geo.cells.top()), pos2(geo.cells.left(), r.bottom()));
-    p.rect_filled(top, 0.0, t.header_bg);
-    p.rect_filled(left, 0.0, t.header_bg);
+    if matches!(part, HeaderPart::All | HeaderPart::Columns) {
+        p.rect_filled(top, 0.0, t.header_bg);
+    }
+    if matches!(part, HeaderPart::All | HeaderPart::Rows) {
+        p.rect_filled(left, 0.0, t.header_bg);
+    }
     let bounds = sel.bounds();
     let col_sel = |c: u32| sel.ranges.iter().any(|x| c >= x.start.col && c <= x.end.col);
     let row_sel = |rr: u32| sel.ranges.iter().any(|x| rr >= x.start.row && rr <= x.end.row);
@@ -692,7 +762,7 @@ pub(crate) fn paint_headers(
     let mut done_rows = std::collections::HashSet::new();
     for (rows, cols, clip) in quads {
         let pc = p.with_clip_rect(Rect::from_min_max(pos2(clip.left(), top.top()), pos2(clip.right(), top.bottom())));
-        if cols.0 <= cols.1 {
+        if cols.0 <= cols.1 && matches!(part, HeaderPart::All | HeaderPart::Columns) {
             for c in cols.0..=cols.1 {
                 if !done_cols.insert((c, clip.left() as i32)) {
                     continue;
@@ -733,7 +803,7 @@ pub(crate) fn paint_headers(
             }
         }
         let pr = p.with_clip_rect(Rect::from_min_max(pos2(left.left(), clip.top()), pos2(left.right(), clip.bottom())));
-        if rows.0 <= rows.1 {
+        if rows.0 <= rows.1 && matches!(part, HeaderPart::All | HeaderPart::Rows) {
             for rr in rows.0..=rows.1 {
                 if !done_rows.insert((rr, clip.top() as i32)) {
                     continue;
@@ -759,6 +829,9 @@ pub(crate) fn paint_headers(
                 pr.text(cr.center(), Align2::CENTER_CENTER, (rr as u64 + 1).to_string(), font.clone(), color);
             }
         }
+    }
+    if !matches!(part, HeaderPart::All | HeaderPart::Frame) {
+        return;
     }
     // Corner (select all) and edges.
     let corner = Rect::from_min_max(r.min, geo.cells.min);
