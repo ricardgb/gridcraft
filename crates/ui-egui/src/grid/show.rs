@@ -202,11 +202,17 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
             if let Some(ch) = outlined {
                 crate::chartview::paint_source_outlines(&tp, &tile, sh, ch);
             }
-            // The objects anchored in this pane move with it, over every
-            // pane: with frozen panes on a layer above all the cells,
-            // clipped to their whole area.
+            // The objects anchored in this pane move with it: with frozen
+            // panes on a layer above all the cells. An object may reach
+            // over the panes beside its own, but it does not slide over
+            // what is frozen on an axis it moves along: a chart scrolled
+            // up goes under the frozen rows, as the cells do.
             if quads.len() > 1 {
-                CellsLayers::place_layer(ui.ctx(), cells_layers.objects[i], Some((shift, geo.cells)));
+                let from = pos2(
+                    if moves.0 { geo.cells.left() + geo.frozen_w } else { geo.cells.left() },
+                    if moves.1 { geo.cells.top() + geo.frozen_h } else { geo.cells.top() },
+                );
+                CellsLayers::place_layer(ui.ctx(), cells_layers.objects[i], Some((shift, Rect::from_min_max(from, geo.cells.max))));
                 tp = ui.ctx().layer_painter(cells_layers.objects[i]);
                 tp.set_clip_rect(tile.cells);
             }
