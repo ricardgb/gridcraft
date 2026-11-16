@@ -306,7 +306,15 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     if geo.paper.is_some() {
         crate::paper_view::paint_rulers(app, &painter, rect, &geo, &t);
     }
-    show_grid_interactions(app, ui, &resp, &geo, sh, &wb);
+    if tiled {
+        // The in-cell editor and the other widgets over the cells go above
+        // the cells' layers: on the grid's own layer they would be under them.
+        let mut top = ui.new_child(egui::UiBuilder::new().layer_id(cells_layers.over).max_rect(ui.max_rect()));
+        top.set_clip_rect(ui.clip_rect());
+        show_grid_interactions(app, &mut top, &resp, &geo, sh, &wb);
+    } else {
+        show_grid_interactions(app, ui, &resp, &geo, sh, &wb);
+    }
     let track_x = vertical_scroll_track(available, rect, rtl);
     // The track starts below the column headings and frozen rows; the bar's column beside them
     // takes its colour too instead of showing a light square in dark mode.
